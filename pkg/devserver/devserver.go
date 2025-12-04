@@ -429,6 +429,17 @@ func start(ctx context.Context, opts StartOpts) error {
 
 	pauseMgr := pauses.NewRedisOnlyManager(sm)
 
+	// Initialize metrics API for Prometheus-compatible metrics endpoint.
+	// This provides system queue depth metrics via /metrics endpoint.
+	metricsAPI, err := metrics.NewMetricsAPI(metrics.Opts{
+		AuthMiddleware: authn.SigningKeyMiddleware(opts.SigningKey),
+		QueueManager:   rq,
+		FunctionReader: dbcqrs,
+	})
+	if err != nil {
+		return err
+	}
+
 	exec, err := executor.NewExecutor(
 		executor.WithHTTPClient(httpClient),
 		executor.WithStateManager(smv2),
@@ -460,6 +471,7 @@ func start(ctx context.Context, opts StartOpts) error {
 				EventTopic: opts.Config.EventStream.Service.Concrete.TopicName(),
 			},
 			run.NewTraceLifecycleListener(nil),
+			metrics.NewPrometheusLifecycleListener(metricsAPI),
 		),
 		executor.WithStepLimits(func(id sv2.ID) int {
 			if override, hasOverride := stepLimitOverrides[id.FunctionID.String()]; hasOverride {
@@ -611,16 +623,6 @@ func start(ctx context.Context, opts StartOpts) error {
 				lifecycles.NewHistoryLifecycle(dbcqrs),
 			}),
 	)
-
-	// Initialize metrics API for Prometheus-compatible metrics endpoint.
-	// This provides system queue depth metrics via /metrics endpoint.
-	metricsAPI, err := metrics.NewMetricsAPI(metrics.Opts{
-		AuthMiddleware: authn.SigningKeyMiddleware(opts.SigningKey),
-		QueueManager:   rq,
-	})
-	if err != nil {
-		return err
-	}
 
 	// Create the API v2 service handler
 	serviceOpts := apiv2.ServiceOptions{

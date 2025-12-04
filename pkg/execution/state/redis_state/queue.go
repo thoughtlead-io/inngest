@@ -3776,3 +3776,57 @@ func (l *leaseDenies) denyThrottle(key string) bool {
 	l.lock.RUnlock()
 	return ok
 }
+
+// ScanConcurrencyKeys scans for all concurrency keys matching the prefix and returns their counts
+func (q *queue) ScanConcurrencyKeys(ctx context.Context, prefixPattern string) (map[string]int64, error) {
+	ctx = redis_telemetry.WithScope(redis_telemetry.WithOpName(ctx, "ScanConcurrencyKeys"), redis_telemetry.ScopeQueue)
+
+	rc := q.primaryQueueShard.RedisClient.unshardedRc
+	kg := q.primaryQueueShard.RedisClient.kg
+
+	// Build the pattern: {queue}:concurrency:<prefix>:*
+	pattern := fmt.Sprintf("%s:concurrency:%s:*", kg.QueuePrefix(), prefixPattern)
+
+	results := make(map[string]int64)
+	now := q.clock.Now().UnixMilli()
+
+	var cursor uint64
+	for {
+		// Use SCAN to find matching keys
+		cmd := rc.B().Scan().Cursor(cursor).Match(pattern).Count(100).Build()
+		resp, err := rc.Do(ctx, cmd).AsScanEntry()
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan concurrency keys: %w", err)
+		}
+
+		// For each key, get the count of in-progress items
+		for _, key := range resp.Elements {
+			// Extract the concurrency key part from the full Redis key
+			// Full key: {queue}:concurrency:custom:f:uuid:hash
+			// We want: f:uuid:hash
+			parts := strings.SplitN(key, ":concurrency:"+prefixPattern+":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			concurrencyKey := parts[1]
+
+			// Count items with valid leases (score > now)
+			countCmd := rc.B().Zcount().Key(key).Min(fmt.Sprintf("%d", now)).Max("+inf").Build()
+			count, err := rc.Do(ctx, countCmd).AsInt64()
+			if err != nil {
+				continue // Skip on error
+			}
+
+			if count > 0 {
+				results[concurrencyKey] = count
+			}
+		}
+
+		cursor = resp.Cursor
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return results, nil
+}

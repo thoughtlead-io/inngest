@@ -1,75 +1,47 @@
 before:
   hooks:
-    - go mod tidy
-    - go generate ./...
-    - make build-ui
+  - go mod tidy
+  - go generate ./...
+  - make build-ui
 
 builds:
-  - env:
-      - CGO_ENABLED=0
-    main: ./cmd/
-    binary: inngest
-    ldflags:
-      - -s -w
-      - -X github.com/inngest/inngest/pkg/inngest/version.Version={{.Version}}
-      - -X github.com/inngest/inngest/pkg/inngest/version.Hash={{.ShortCommit}}
-    goos:
-      - linux
-      - windows
-      - darwin
-    goarch:
-      - amd64
-      - arm64
+- env:
+  - CGO_ENABLED=0
+  main: ./cmd/
+  binary: inngest
+  ldflags:
+  - -s -w
+  - -X github.com/inngest/inngest/pkg/inngest/version.Version={{.Version}}
+  - -X github.com/inngest/inngest/pkg/inngest/version.Hash={{.ShortCommit}}
+  goos:
+  - linux
+  goarch:
+  - amd64
 
 dockers:
-  - id: inngest-amd64
-    goos: linux
-    goarch: amd64
-    skip_push: false
-    use: buildx
-    dockerfile: 'Dockerfile.goreleaser'
-    image_templates:
-    - "inngest/inngest:latest-amd64"
-    - "inngest/inngest:{{ .Tag }}-amd64"
-    build_flag_templates:
-    - "--pull"
-    - "--label=org.opencontainers.image.created={{.Date}}"
-    - "--label=org.opencontainers.image.title={{.ProjectName}}"
-    - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-    - "--label=org.opencontainers.image.version={{.Version}}"
-    - "--platform=linux/amd64"
-  - id: inngest-arm64
-    goos: linux
-    goarch: arm64
-    skip_push: false
-    use: buildx
-    dockerfile: 'Dockerfile.goreleaser'
-    image_templates:
-    - "inngest/inngest:latest-arm64v8"
-    - "inngest/inngest:{{ .Tag }}-arm64v8"
-    build_flag_templates:
-    - "--pull"
-    - "--label=org.opencontainers.image.created={{.Date}}"
-    - "--label=org.opencontainers.image.title={{.ProjectName}}"
-    - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-    - "--label=org.opencontainers.image.version={{.Version}}"
-    - "--platform=linux/arm64"
-docker_manifests:
-  - name_template: inngest/inngest:latest
-    image_templates:
-      - inngest/inngest:latest-amd64
-      - inngest/inngest:latest-arm64v8
-  - name_template: inngest/inngest:{{ .Tag }}
-    image_templates:
-      - inngest/inngest:{{ .Tag }}-amd64
-      - inngest/inngest:{{ .Tag }}-arm64v8
+- id: inngest-amd64
+  goos: linux
+  goarch: amd64
+  skip_push: false
+  use: buildx
+  dockerfile: 'Dockerfile.goreleaser'
+  image_templates:
+  - "ECR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/inngest:latest"
+  - "ECR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/inngest:{{ .Tag }}"
+  build_flag_templates:
+  - "--pull"
+  - "--label=org.opencontainers.image.created={{.Date}}"
+  - "--label=org.opencontainers.image.title={{.ProjectName}}"
+  - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+  - "--label=org.opencontainers.image.version={{.Version}}"
+  - "--platform=linux/amd64"
 
 archives:
-  - format_overrides:
-      - goos: windows
-        format: zip
-    files:
-      - LICENSE.md
+- format_overrides:
+  - goos: windows
+    format: zip
+  files:
+  - LICENSE.md
 
 checksum:
   name_template: 'checksums.txt'
@@ -81,12 +53,10 @@ changelog:
   sort: asc
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
+    - '^docs:'
+    - '^test:'
 
-release:
-  # Repo in which the release will be created.
-  # Default is extracted from the origin remote URL or empty if its private hosted.
-  github:
-    owner: inngest
-    name: inngest
+# release:
+#   github:
+#     owner: thoughtlead-io
+#     name: inngest

@@ -122,7 +122,7 @@ type CustomConcurrency struct {
 
 	// UnhashedEvaluatedKeyValue stores the unhashed evaluated key value.
 	// This is only set after Schedule() or backlog normalization.
-	UnhashedEvaluatedKeyValue string `json:"-"`
+	UnhashedEvaluatedKeyValue string `json:"uekv,omitempty"`
 }
 
 func (c CustomConcurrency) Validate() error {
