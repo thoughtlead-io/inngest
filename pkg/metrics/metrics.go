@@ -270,7 +270,6 @@ func (api *MetricsAPI) getFunctionSlug(ctx context.Context, fnID uuid.UUID) stri
 
 // updateConcurrencyMetrics scans and updates all concurrency metrics
 func (api *MetricsAPI) updateConcurrencyMetrics(ctx context.Context) {
-	api.concurrencyGauge.Reset()
 	// Track function-level concurrency (prefix "p" for partition)
 	fnConcurrency, err := api.opts.QueueManager.ScanConcurrencyKeys(ctx, "p")
 	if err == nil {
