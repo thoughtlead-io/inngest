@@ -21,11 +21,16 @@ var testSigningKey = "signkey-test-abc123def456"
 
 // integrationQueueManager is a test queue manager for integration tests
 type integrationQueueManager struct {
-	queueDepth int64
+	queueDepth      int64
+	concurrencyKeys map[string]int64
 }
 
 func (m *integrationQueueManager) TotalSystemQueueDepth(ctx context.Context) (int64, error) {
 	return atomic.LoadInt64(&m.queueDepth), nil
+}
+
+func (m *integrationQueueManager) ScanConcurrencyKeys(ctx context.Context, prefixPattern string) (map[string]int64, error) {
+	return m.concurrencyKeys, nil
 }
 
 func (m *integrationQueueManager) SetQueueDepth(depth int64) {

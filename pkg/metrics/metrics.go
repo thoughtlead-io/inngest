@@ -113,7 +113,8 @@ type MetricsAPI struct {
 
 	registry *prometheus.Registry
 
-	functionNameCache map[uuid.UUID]string
+	functionNameCache   map[uuid.UUID]string
+	seenConcurrencyKeys map[string]bool
 }
 
 // NewMetricsAPI creates a new metrics API instance with Prometheus integration
@@ -178,16 +179,17 @@ func NewMetricsAPI(opts Opts) (*MetricsAPI, error) {
 	)
 
 	api := &MetricsAPI{
-		opts:              opts,
-		Router:            chi.NewRouter(),
-		queueGauge:        queueGauge,
-		concurrencyGauge:  concurrencyGauge,
-		fnRunScheduled:    fnRunScheduled,
-		fnRunStarted:      fnRunStarted,
-		fnRunEnded:        fnRunEnded,
-		stepOutputBytes:   stepOutputBytes,
-		registry:          registry,
-		functionNameCache: make(map[uuid.UUID]string),
+		opts:                opts,
+		Router:              chi.NewRouter(),
+		queueGauge:          queueGauge,
+		concurrencyGauge:    concurrencyGauge,
+		fnRunScheduled:      fnRunScheduled,
+		fnRunStarted:        fnRunStarted,
+		fnRunEnded:          fnRunEnded,
+		stepOutputBytes:     stepOutputBytes,
+		registry:            registry,
+		functionNameCache:   make(map[uuid.UUID]string),
+		seenConcurrencyKeys: make(map[string]bool),
 	}
 
 	api.setupRoutes()
@@ -270,6 +272,14 @@ func (api *MetricsAPI) getFunctionSlug(ctx context.Context, fnID uuid.UUID) stri
 
 // updateConcurrencyMetrics scans and updates all concurrency metrics
 func (api *MetricsAPI) updateConcurrencyMetrics(ctx context.Context) {
+	// Track which keys we found in this scan
+	currentKeys := make(map[string]bool)
+
+	// Helper to build label key and track current values
+	buildLabelKey := func(typeVal, scope, entity, key string) string {
+		return fmt.Sprintf("%s:%s:%s:%s", typeVal, scope, entity, key)
+	}
+
 	// Track function-level concurrency (prefix "p" for partition)
 	fnConcurrency, err := api.opts.QueueManager.ScanConcurrencyKeys(ctx, "p")
 	if err == nil {
@@ -301,6 +311,8 @@ func (api *MetricsAPI) updateConcurrencyMetrics(ctx context.Context) {
 				}
 			}
 
+			labelKey := buildLabelKey("system", "fn", functionName, concurrencyKey)
+			currentKeys[labelKey] = true
 			api.concurrencyGauge.WithLabelValues("system", "fn", functionName, concurrencyKey).Set(float64(count))
 		}
 	}
@@ -316,6 +328,8 @@ func (api *MetricsAPI) updateConcurrencyMetrics(ctx context.Context) {
 				accountID = parts[1]
 			}
 
+			labelKey := buildLabelKey("system", "account", accountID, "")
+			currentKeys[labelKey] = true
 			api.concurrencyGauge.WithLabelValues("system", "account", accountID, "").Set(float64(count))
 		}
 	}
@@ -348,8 +362,28 @@ func (api *MetricsAPI) updateConcurrencyMetrics(ctx context.Context) {
 					scope = "unknown"
 				}
 
+				labelKey := buildLabelKey("custom", scope, entityID, concurrencyKey)
+				currentKeys[labelKey] = true
 				api.concurrencyGauge.WithLabelValues("custom", scope, entityID, concurrencyKey).Set(float64(count))
 			}
 		}
+	}
+
+	// For all previously seen keys that weren't found in this scan, set to 0 and remove
+	for labelKey := range api.seenConcurrencyKeys {
+		if _, found := currentKeys[labelKey]; !found {
+			// Parse the label key back to label values
+			parts := strings.SplitN(labelKey, ":", 4)
+			if len(parts) == 4 {
+				api.concurrencyGauge.WithLabelValues(parts[0], parts[1], parts[2], parts[3]).Set(0)
+			}
+			// Delete from map since it no longer exists in Redis
+			delete(api.seenConcurrencyKeys, labelKey)
+		}
+	}
+
+	// Add all current keys to seenConcurrencyKeys (including new ones)
+	for labelKey := range currentKeys {
+		api.seenConcurrencyKeys[labelKey] = true
 	}
 }

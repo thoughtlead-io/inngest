@@ -14,12 +14,17 @@ import (
 
 // mockQueueManager implements QueueManager interface for testing
 type mockQueueManager struct {
-	queueDepth int64
-	err        error
+	queueDepth      int64
+	err             error
+	concurrencyKeys map[string]int64
 }
 
 func (m *mockQueueManager) TotalSystemQueueDepth(ctx context.Context) (int64, error) {
 	return m.queueDepth, m.err
+}
+
+func (m *mockQueueManager) ScanConcurrencyKeys(ctx context.Context, prefixPattern string) (map[string]int64, error) {
+	return m.concurrencyKeys, m.err
 }
 
 // mockAuthMiddleware creates a test auth middleware
