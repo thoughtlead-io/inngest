@@ -18,5 +18,14 @@ if [ -n "$GLOBAL_HOOKS_PATH" ]; then
   fi
 fi
 
+# Source zsh profile to get proper PATH (since npx works in terminal)
+if [ -f "$HOME/.zshrc" ]; then
+  # Use zsh to source the profile and export PATH, then run in sh
+  export PATH="$PATH:$(zsh -c 'source ~/.zshrc 2>/dev/null; echo $PATH' 2>/dev/null || echo '')"
+fi
+
+# Also add common Node.js locations
+export PATH="$PATH:/usr/local/bin:$HOME/.local/bin"
+
 cd ui/
 npx lint-staged
