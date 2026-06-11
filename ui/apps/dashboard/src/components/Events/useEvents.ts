@@ -89,7 +89,7 @@ export function useEvents() {
             startTime,
             endTime,
             cursor,
-            celQuery,
+            celQuery: celQuery ?? '',
             eventNames,
             includeInternalEvents,
           },
@@ -109,14 +109,6 @@ export function useEvents() {
       const events = eventsData.edges.map(({ node }) => ({
         ...node,
         receivedAt: new Date(node.receivedAt),
-        runs: node.runs.map((run) => ({
-          fnName: run.function.name,
-          fnSlug: run.function.slug,
-          status: run.status,
-          id: run.id,
-          completedAt: run.endedAt ? new Date(run.endedAt) : undefined,
-          startedAt: run.startedAt ? new Date(run.startedAt) : undefined,
-        })),
       }));
 
       return {

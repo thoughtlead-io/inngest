@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/99designs/gqlgen/graphql"
 	loader "github.com/inngest/inngest/pkg/coreapi/graph/loaders"
 	"github.com/inngest/inngest/pkg/coreapi/graph/models"
 	"github.com/inngest/inngest/pkg/cqrs"
@@ -20,7 +21,49 @@ const (
 	maxRunItems     = 400
 )
 
+func ensureRunsFilterHasQuery(filter *models.RunsFilterV2, args map[string]any) {
+	if filter == nil {
+		return
+	}
+	if filter.Query != nil && *filter.Query != "" {
+		return
+	}
+	if args == nil {
+		return
+	}
+
+	// Backwards/alternate client support: some clients may send `celQuery` as a top-level
+	// argument instead of nesting it under `filter.query`.
+	if celQuery, ok := args["celQuery"].(string); ok && celQuery != "" {
+		filter.Query = &celQuery
+		return
+	}
+
+	// Standard: `filter.query`
+	switch v := args["filter"].(type) {
+	case models.RunsFilterV2:
+		if v.Query != nil && *v.Query != "" {
+			filter.Query = v.Query
+			return
+		}
+	case *models.RunsFilterV2:
+		if v != nil && v.Query != nil && *v.Query != "" {
+			filter.Query = v.Query
+			return
+		}
+	case map[string]any:
+		if q, ok := v["query"].(string); ok && q != "" {
+			filter.Query = &q
+			return
+		}
+	}
+}
+
 func (qr *queryResolver) Runs(ctx context.Context, num int, cur *string, order []*models.RunsV2OrderBy, filter models.RunsFilterV2, preview *bool) (*models.RunsV2Connection, error) {
+	if fieldCtx := graphql.GetFieldContext(ctx); fieldCtx != nil {
+		ensureRunsFilterHasQuery(&filter, fieldCtx.Args)
+	}
+
 	opts := toRunsQueryOpt(num, cur, order, filter, preview)
 	runs, err := qr.Data.GetTraceRuns(ctx, opts)
 	if err != nil {
@@ -153,12 +196,18 @@ func (qr *queryResolver) Runs(ctx context.Context, num int, cur *string, order [
 		EndCursor:   ecursor,
 	}
 
+	previewMode := false
+	if preview != nil {
+		previewMode = *preview
+	}
+
 	return &models.RunsV2Connection{
 		Edges:    edges,
 		PageInfo: pageInfo,
 		After:    cur,
 		Filter:   filter,
 		OrderBy:  order,
+		Preview:  previewMode,
 	}, nil
 }
 
@@ -408,7 +457,20 @@ func (qr *queryResolver) RunTrigger(ctx context.Context, runID string) (*models.
 }
 
 func (r *runsV2ConnResolver) TotalCount(ctx context.Context, obj *models.RunsV2Connection, preview *bool) (int, error) {
-	opts := toRunsQueryOpt(0, obj.After, obj.OrderBy, obj.Filter, preview)
+	// Use filter from the connection object, which contains the CEL query if it was passed
+	filter := obj.Filter
+
+	if fieldCtx := graphql.GetFieldContext(ctx); fieldCtx != nil && fieldCtx.Parent != nil {
+		ensureRunsFilterHasQuery(&filter, fieldCtx.Parent.Args)
+	}
+
+	// Default preview to the parent runs() preview mode if the field argument is omitted.
+	effectivePreview := preview
+	if effectivePreview == nil {
+		effectivePreview = &obj.Preview
+	}
+
+	opts := toRunsQueryOpt(0, obj.After, obj.OrderBy, filter, effectivePreview)
 	count, err := r.Data.GetTraceRunsCount(ctx, opts)
 	if err != nil {
 		return 0, fmt.Errorf("error retrieving count for runs: %w", err)
@@ -505,6 +567,11 @@ func toRunsQueryOpt(
 		items = num
 	}
 
+	previewMode := false
+	if preview != nil {
+		previewMode = *preview
+	}
+
 	return cqrs.GetTraceRunOpt{
 		Filter: cqrs.GetTraceRunFilter{
 			AppID:      filter.AppIDs,
@@ -518,6 +585,6 @@ func toRunsQueryOpt(
 		Order:   orderBy,
 		Cursor:  cursor,
 		Items:   uint(items),
-		Preview: preview != nil && *preview,
+		Preview: previewMode,
 	}
 }

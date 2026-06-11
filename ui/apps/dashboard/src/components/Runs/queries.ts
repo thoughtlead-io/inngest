@@ -70,6 +70,7 @@ export const CountRunsDocument = graphql(`
     $timeField: RunsOrderByField!
     $functionSlug: String
     $celQuery: String = null
+    $preview: Boolean = false
   ) {
     environment: workspace(id: $environmentID) {
       runs(
@@ -83,8 +84,9 @@ export const CountRunsDocument = graphql(`
           query: $celQuery
         }
         orderBy: [{ field: $timeField, direction: DESC }]
+        preview: $preview
       ) {
-        totalCount
+        totalCount(preview: $preview)
       }
     }
   }

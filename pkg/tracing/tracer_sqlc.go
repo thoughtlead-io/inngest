@@ -274,6 +274,28 @@ func (e *dbExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlyS
 			)
 			continue
 		}
+
+		// After line 261 where EventIds is set
+		// if len(eventIdsByt) > 0 {
+		// 	var eventIDs []string
+		// 	if err := json.Unmarshal(eventIdsByt, &eventIDs); err == nil {
+		// 		// Insert into span_events table
+		// 		for _, eventID := range eventIDs {
+		// 			if err := e.q.InsertSpanEvent(ctx, sqlc.InsertSpanEventParams{
+		// 				TraceID: traceID,
+		// 				SpanID:  spanID,
+		// 				EventID: eventID,
+		// 			}); err != nil {
+		// 				logger.StdlibLogger(ctx).Error("failed to insert span event relation",
+		// 					"trace_id", traceID,
+		// 					"span_id", spanID,
+		// 					"event_id", eventID,
+		// 					"error", err,
+		// 				)
+		// 			}
+		// 		}
+		// 	}
+		// }
 	}
 	return nil
 }

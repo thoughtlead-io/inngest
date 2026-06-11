@@ -23,6 +23,10 @@ func TestValidateExpressionHandler(t *testing.T) {
 			cel:  []string{`event.name == "test/hello"`, `output.success == true`},
 		},
 		{
+			name: "single '=' is normalized to CEL '=='",
+			cel:  []string{`event.data.automation_id = 'KRDv7VtaADXr'`},
+		},
+		{
 			name:   "invalid AND",
 			cel:    []string{`event.name == "test/hello" and event.ts > 1727291508963`},
 			errStr: "mismatched input 'and'",
@@ -176,6 +180,13 @@ func TestToSQLFilters(t *testing.T) {
 					sq.C("event_name").Neq("test/yolo"),
 					sq.C("event_ts").Gte(int64(1727291508963)),
 				),
+			},
+		},
+		{
+			name: "event.data fields map to event_data JSON paths (direct or wrapped)",
+			cel:  []string{`event.data.automation_id == "KRDv7VtaADXr"`},
+			expected: []sq.Expression{
+				sq.L("COALESCE(event_data #>> '{data,automation_id}', event_data #>> '{automation_id}', event_data #>> '{event,data,automation_id}', event_data #>> '{events,0,data,automation_id}') = ?", "KRDv7VtaADXr"),
 			},
 		},
 	}

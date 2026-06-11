@@ -85,7 +85,7 @@ function RunsComponent() {
         endTime: endTime,
         status: filteredStatus,
         timeField,
-        celQuery: search,
+        celQuery: search ?? '',
         preview,
       });
 
@@ -154,7 +154,7 @@ function RunsComponent() {
         endTime,
         status: filteredStatus,
         timeField,
-        celQuery: search,
+        celQuery: search ?? '',
       });
       setTotalCount(data.runs.totalCount);
     })();

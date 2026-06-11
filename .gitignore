@@ -33,3 +33,9 @@ docs/openapi/v3/
 # Go workspace file
 go.work
 go.work.sum
+
+# Local Go build cache
+.gocache/
+
+# Generated per-release goreleaser config
+.goreleaser.beta.yml

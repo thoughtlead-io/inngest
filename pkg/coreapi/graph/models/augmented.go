@@ -23,6 +23,10 @@ type RunsV2Connection struct {
 	After   *string
 	Filter  RunsFilterV2
 	OrderBy []*RunsV2OrderBy
+	// Preview indicates whether this connection was generated from preview (span-based)
+	// runs. This allows nested resolvers like totalCount(preview:) to default to the
+	// same preview mode as the parent runs() field even if the argument is omitted.
+	Preview bool
 }
 
 type RunTraceSpan struct {

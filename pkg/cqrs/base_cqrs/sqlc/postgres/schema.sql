@@ -38,7 +38,7 @@ CREATE TABLE events (
 	received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	event_id VARCHAR NOT NULL,
 	event_name VARCHAR NOT NULL,
-	event_data VARCHAR DEFAULT '{}' NOT NULL,
+	event_data JSONB DEFAULT '{}'::JSONB NOT NULL,
 	event_user VARCHAR DEFAULT '{}' NOT NULL,
 	event_v VARCHAR,
 	event_ts TIMESTAMP NOT NULL

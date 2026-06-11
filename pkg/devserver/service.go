@@ -62,7 +62,6 @@ func NewService(opts StartOpts, runner runner.Runner, data cqrs.Manager, pb pubs
 		stepLimitOverrides:      stepLimitOverrides,
 		stateSizeLimitOverrides: stateSizeLimitOverrides,
 		redisClient:             rc,
-		historyWriter:           hw,
 		singleNodeServiceOpts:   snso,
 		log:                     logger.StdlibLogger(context.Background()),
 	}
@@ -92,8 +91,6 @@ type devserver struct {
 	redisClient rueidis.Client
 
 	Apiservice service.Service
-
-	historyWriter history.Driver
 
 	// handlers are updated by the API (d.apiservice) when registering functions.
 	handlers    []SDKHandler
@@ -300,6 +297,14 @@ func (d *devserver) pollSDKs(ctx context.Context) {
 		// use https during development
 		if !strings.Contains(url, "://") {
 			url = "http://" + url
+		}
+
+		// If an app already exists for this URL, do NOT upsert a placeholder.
+		// UpsertApp overwrites all fields, so a placeholder upsert would wipe
+		// existing app metadata (name, SDK version, etc) and can also create
+		// duplicates if other code paths used a different deterministic ID.
+		if _, err := d.Data.GetAppByURL(ctx, consts.DevServerEnvID, url); err == nil {
+			continue
 		}
 
 		// Create a new app which holds the error message.

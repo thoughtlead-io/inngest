@@ -25,6 +25,104 @@ var (
 type ExprHandlerOpt func(ctx context.Context, h *ExpressionHandler) error
 type ExprSQLConverter func(ctx context.Context, n *expr.Node) ([]sq.Expression, error)
 
+// normalizeCELExpression attempts to make CEL parsing more forgiving for users
+// who type SQL-like equality (`=`) instead of CEL equality (`==`).
+//
+// This only rewrites single '=' tokens which are not part of '==', '!=', '<=', '>='
+// and only when they appear outside of quoted string literals.
+func normalizeCELExpression(s string) string {
+	// Fast path.
+	if !strings.Contains(s, "=") {
+		return s
+	}
+
+	prevNonSpace := func(str string, i int) byte {
+		for i >= 0 {
+			switch str[i] {
+			case ' ', '\t', '\n', '\r':
+				i--
+				continue
+			default:
+				return str[i]
+			}
+		}
+		return 0
+	}
+	nextNonSpace := func(str string, i int) byte {
+		for i < len(str) {
+			switch str[i] {
+			case ' ', '\t', '\n', '\r':
+				i++
+				continue
+			default:
+				return str[i]
+			}
+		}
+		return 0
+	}
+
+	out := make([]byte, 0, len(s)+4)
+	inSingle := false
+	inDouble := false
+	escaped := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if escaped {
+			out = append(out, c)
+			escaped = false
+			continue
+		}
+
+		// Track escapes to avoid toggling quote state within escaped strings.
+		if c == '\\' {
+			out = append(out, c)
+			escaped = true
+			continue
+		}
+
+		// If we're inside a string literal, just copy until we exit.
+		if inSingle {
+			out = append(out, c)
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			out = append(out, c)
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+
+		switch c {
+		case '\'':
+			inSingle = true
+			out = append(out, c)
+		case '"':
+			inDouble = true
+			out = append(out, c)
+		case '=':
+			p := prevNonSpace(s, i-1)
+			n := nextNonSpace(s, i+1)
+			// Rewrite `a = b` into `a == b`.
+			// Do not touch operators: ==, !=, <=, >=
+			if p != '<' && p != '>' && p != '!' && p != '=' && n != '=' {
+				out = append(out, '=', '=')
+			} else {
+				out = append(out, c)
+			}
+		default:
+			out = append(out, c)
+		}
+	}
+
+	return string(out)
+}
+
 func WithExpressionHandlerExpressions(cel []string) ExprHandlerOpt {
 	return func(ctx context.Context, h *ExpressionHandler) error {
 		if len(cel) == 0 {
@@ -90,8 +188,11 @@ func (h *ExpressionHandler) add(ctx context.Context, cel []string) error {
 	outputExprs := map[string]bool{}
 
 	for _, e := range cel {
+		original := e
+		e = normalizeCELExpression(e)
+
 		// empty string, skip
-		for len(e) == 0 {
+		if len(e) == 0 {
 			continue
 		}
 
@@ -107,7 +208,8 @@ func (h *ExpressionHandler) add(ctx context.Context, cel []string) error {
 			// Only take the first one, the rest is not needed.
 			// then remove the prefix `ERROR : <input>:1:\d:` and use the rest of the error body
 			msg := exprErrorRegex.ReplaceAllString(errs[0], "")
-			return fmt.Errorf("%s\n | %s", msg, e)
+			// Show the original expression to the user, even if we normalized it for parsing.
+			return fmt.Errorf("%s\n | %s", msg, original)
 		}
 		if tree.HasMacros {
 			return fmt.Errorf("macros are currently not supported")
@@ -118,6 +220,7 @@ func (h *ExpressionHandler) add(ctx context.Context, cel []string) error {
 			return fmt.Errorf("invalid syntax detected")
 		}
 
+		// Use the normalized expression for storage and future parsing.
 		h.addToExprList(ctx, []*expr.Node{&tree.Root}, e, evtExprs, outputExprs)
 	}
 
@@ -217,7 +320,24 @@ func (h *ExpressionHandler) MatchEventExpressions(ctx context.Context, evt event
 
 	eg, ctx := errgroup.WithContext(ctx)
 	res := make([]bool, len(h.EventExprList))
+
+	// Build CEL "event" object, but remap event.data to payload.event.data when present
 	data := evt.Map()
+	if payloadEvent, ok := evt.Data["event"].(map[string]any); ok {
+		if inner, ok := payloadEvent["data"].(map[string]any); ok {
+			data["data"] = inner
+		}
+	}
+	// Optional fallback: if "event" isn't present but "events":[{data:...}] is
+	if _, hasEvent := evt.Data["event"]; !hasEvent {
+		if payloadEvents, ok := evt.Data["events"].([]any); ok && len(payloadEvents) > 0 {
+			if first, ok := payloadEvents[0].(map[string]any); ok {
+				if inner, ok := first["data"].(map[string]any); ok {
+					data["data"] = inner
+				}
+			}
+		}
+	}
 
 	for i, e := range h.EventExprList {
 		idx := i
@@ -231,8 +351,6 @@ func (h *ExpressionHandler) MatchEventExpressions(ctx context.Context, evt event
 
 			ok, err := eval.Evaluate(ctx, expressions.NewData(map[string]any{"event": data}))
 			if err != nil {
-				// if there's an error, it likely means the data being matched is not of the same structure
-				// map[string]any vs int64
 				res[idx] = false
 				return nil
 			}
@@ -245,7 +363,6 @@ func (h *ExpressionHandler) MatchEventExpressions(ctx context.Context, evt event
 	if err := eg.Wait(); err != nil {
 		return false, err
 	}
-
 	return allMatches(res), nil
 }
 
@@ -372,9 +489,64 @@ func (h *ExpressionHandler) toSQLFilters(ctx context.Context, nodes []*expr.Node
 func SQLiteConverter(ctx context.Context, n *expr.Node) ([]sq.Expression, error) {
 	filters := []sq.Expression{}
 	if n.HasPredicate() {
+		ident := n.Predicate.Ident
 		literal := n.Predicate.Literal
 
-		switch n.Predicate.Ident {
+		if strings.HasPrefix(ident, "event.data.") {
+			// Generic event.data.<field>[.<nested>...] support
+			fieldPath := strings.TrimPrefix(ident, "event.data.")
+			pathParts := strings.Split(fieldPath, ".")
+
+			// normalize duplicate event.data prefix
+			if len(pathParts) >= 2 && pathParts[0] == "event" && pathParts[1] == "data" {
+				pathParts = pathParts[2:]
+			}
+
+			// events.event_data commonly stores the full event payload (eg `{id,name,data,ts}`),
+			// meaning the user-facing "event.data.*" maps to `event_data.data.*`.
+			//
+			// Some internal events wrap the original payload under `event.data`, and some store
+			// the original event under `events[0].data`. Historically some deployments also
+			// stored the data object directly at the root of event_data.
+			//
+			// To support all shapes, query via COALESCE(data, direct, wrapped, events[0].data).
+			dataTextPath := fmt.Sprintf("{%s}", strings.Join(append([]string{"data"}, pathParts...), ","))
+			directTextPath := fmt.Sprintf("{%s}", strings.Join(pathParts, ","))
+			wrappedTextPath := fmt.Sprintf("{%s}", strings.Join(append([]string{"event", "data"}, pathParts...), ","))
+			events0TextPath := fmt.Sprintf("{%s}", strings.Join(append([]string{"events", "0", "data"}, pathParts...), ","))
+
+			val := fmt.Sprint(literal) // compare as text
+
+			switch n.Predicate.Operator {
+			case operators.Equals:
+				filters = append(filters, sq.L(
+					fmt.Sprintf(
+						"COALESCE(event_data #>> '%s', event_data #>> '%s', event_data #>> '%s', event_data #>> '%s') = ?",
+						dataTextPath,
+						directTextPath,
+						wrappedTextPath,
+						events0TextPath,
+					),
+					val,
+				))
+			case operators.NotEquals:
+				filters = append(filters, sq.L(
+					fmt.Sprintf(
+						"COALESCE(event_data #>> '%s', event_data #>> '%s', event_data #>> '%s', event_data #>> '%s') != ?",
+						dataTextPath,
+						directTextPath,
+						wrappedTextPath,
+						events0TextPath,
+					),
+					val,
+				))
+			default:
+				return nil, fmt.Errorf("unsupported operator %s for %s", n.Predicate.Operator, ident)
+			}
+
+			return filters, nil
+		}
+		switch ident {
 		case "event.id":
 			id, ok := literal.(string)
 			if !ok {

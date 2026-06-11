@@ -64,8 +64,24 @@ snapshot:
 
 .PHONY: build-ui
 build-ui:
-	cd ui/apps/dev-server-ui && pnpm install --frozen-lockfile
-	cd ui/apps/dev-server-ui && pnpm build
+	@if command -v pnpm >/dev/null 2>&1; then \
+		PNPM_CMD=pnpm; \
+	elif command -v corepack >/dev/null 2>&1; then \
+		corepack enable >/dev/null 2>&1 || true; \
+		PNPM_CMD=$$(command -v pnpm 2>/dev/null || echo "corepack pnpm"); \
+	else \
+		PNPM_CMD="npx -y pnpm"; \
+	fi; \
+	cd ui/apps/dev-server-ui && $$PNPM_CMD install --frozen-lockfile
+	@if command -v pnpm >/dev/null 2>&1; then \
+		PNPM_CMD=pnpm; \
+	elif command -v corepack >/dev/null 2>&1; then \
+		corepack enable >/dev/null 2>&1 || true; \
+		PNPM_CMD=$$(command -v pnpm 2>/dev/null || echo "corepack pnpm"); \
+	else \
+		PNPM_CMD="npx -y pnpm"; \
+	fi; \
+	cd ui/apps/dev-server-ui && $$PNPM_CMD build
 	cp -r ./ui/apps/dev-server-ui/dist/* ./pkg/devserver/static/
 
 # Generate OpenAPI documentation from protobuf files

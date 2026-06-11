@@ -140,7 +140,7 @@ export function EventsTable({
         source,
         startTime: calculatedStartTime.toISOString(),
         endTime: endTime ?? null,
-        celQuery: search,
+        celQuery: search ?? '',
         includeInternalEvents: singleEventTypePage || (includeInternalEvents ?? false),
       },
     ],
@@ -151,7 +151,7 @@ export function EventsTable({
         source,
         startTime: calculatedStartTime.toISOString(),
         endTime: endTime ?? null,
-        celQuery: search,
+        celQuery: search ?? '',
         includeInternalEvents: singleEventTypePage || (includeInternalEvents ?? false),
       }),
     getNextPageParam: (lastPage) => {

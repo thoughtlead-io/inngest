@@ -309,10 +309,16 @@ export const COUNT_RUNS = gql`
     $startTime: Time!
     $status: [FunctionRunStatus!]
     $timeField: RunsV2OrderByField!
+    $celQuery: String = null
     $preview: Boolean = false
   ) {
     runs(
-      filter: { from: $startTime, status: $status, timeField: $timeField }
+      filter: {
+        from: $startTime
+        status: $status
+        timeField: $timeField
+        query: $celQuery
+      }
       orderBy: [{ field: $timeField, direction: DESC }]
       preview: $preview
     ) {
@@ -564,16 +570,6 @@ export const GET_EVENTS = gql`
           name
           id
           receivedAt
-          runs {
-            status
-            id
-            startedAt
-            endedAt
-            function {
-              name
-              slug
-            }
-          }
         }
       }
       totalCount

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/inngest/inngest/pkg/consts"
@@ -12,6 +13,14 @@ import (
 	"github.com/inngest/inngest/pkg/execution/history"
 	"github.com/inngest/inngest/pkg/history_drivers/memory_store"
 	"github.com/inngest/inngest/pkg/logger"
+	"github.com/oklog/ulid/v2"
+)
+
+const (
+	// MaxRuns limits the number of runs stored in memory to prevent unbounded growth
+	MaxRuns = 1000
+	// MaxHistoryPerRun limits the number of history items per run
+	MaxHistoryPerRun = 1000
 )
 
 type WriterOptions struct {
@@ -109,7 +118,52 @@ func (w *writer) writeHistory(
 ) {
 	run := w.store.Data[item.RunID]
 	run.History = append(run.History, item)
+
+	// Limit history items per run to prevent unbounded growth
+	if len(run.History) > MaxHistoryPerRun {
+		// Keep the most recent items
+		run.History = run.History[len(run.History)-MaxHistoryPerRun:]
+	}
+
 	w.store.Data[item.RunID] = run
+
+	// Clean up old runs if we exceed the limit
+	w.cleanupOldRuns(ctx)
+}
+
+func (w *writer) cleanupOldRuns(ctx context.Context) {
+	if len(w.store.Data) <= MaxRuns {
+		return
+	}
+
+	// Find the oldest runs by RunID (ULID contains timestamp)
+	type runEntry struct {
+		runID ulid.ULID
+		time  time.Time
+	}
+
+	runs := make([]runEntry, 0, len(w.store.Data))
+	for runID := range w.store.Data {
+		runs = append(runs, runEntry{
+			runID: runID,
+			time:  ulid.Time(runID.Time()),
+		})
+	}
+
+	// Sort by time (oldest first)
+	sort.Slice(runs, func(i, j int) bool {
+		return runs[i].time.Before(runs[j].time)
+	})
+
+	// Remove oldest runs until we're under the limit
+	toRemove := len(w.store.Data) - MaxRuns
+	for i := 0; i < toRemove; i++ {
+		delete(w.store.Data, runs[i].runID)
+	}
+
+	if toRemove > 0 {
+		w.log.Debug("cleaned up old runs", "removed", toRemove, "remaining", len(w.store.Data))
+	}
 }
 
 func (w *writer) writeWorkflowEnd(

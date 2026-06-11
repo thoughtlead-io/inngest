@@ -99,7 +99,7 @@ export const Runs = forwardRef<RefreshRunsRef, Props>(function Runs(
       endTime: endTime ?? null,
       status: filteredStatus.length > 0 ? filteredStatus : null,
       timeField,
-      celQuery: search,
+      celQuery: search ?? '',
     }),
     [
       appIDs,
@@ -130,7 +130,7 @@ export const Runs = forwardRef<RefreshRunsRef, Props>(function Runs(
   const [countRes] = useQuery({
     query: CountRunsDocument,
     requestPolicy: 'network-only',
-    variables: commonQueryVars,
+    variables: { ...commonQueryVars, preview: tracePreviewEnabled },
   });
 
   const searchError = parseCelSearchError(paginationError || countRes.error);

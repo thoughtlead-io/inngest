@@ -34,6 +34,10 @@ func Command() *cli.Command {
 				Aliases: []string{"u"},
 				Usage:   "App serve URLs to sync (ex. http://localhost:3000/api/inngest)",
 			},
+			&cli.BoolFlag{
+				Name:  "no-poll",
+				Usage: "Disable polling of apps for updates",
+			},
 			&cli.StringFlag{
 				Name:  "signing-key",
 				Usage: "Signing key used to sign and validate data between the server and apps. Must be hex string with even number of chars",

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,6 +46,49 @@ var (
 	endULID = ulid.ULID([16]byte{'Z'})
 	nilUUID = uuid.UUID{}
 )
+
+var (
+	runsCELDebugEnabled    = os.Getenv("INNGEST_DEBUG_RUNS_CEL") != ""
+	celGenericDebugEnabled = os.Getenv("INNGEST_DEBUG_CEL_SQL") != ""
+)
+
+func runsCELDebugf(format string, args ...any) {
+	if !runsCELDebugEnabled {
+		return
+	}
+	fmt.Printf(format, args...)
+}
+
+func celSQLDebugf(format string, args ...any) {
+	if !celGenericDebugEnabled {
+		return
+	}
+	fmt.Printf(format, args...)
+}
+
+// spanEventIDStringsFromEventInternalID converts a scanned events.internal_id value into
+// the ULID string form stored in spans.event_ids (JSON array of strings).
+//
+// - Postgres: internal_id is BYTEA of 16 ULID bytes
+// - Sqlite: internal_id is CHAR(26) ULID string (but may scan as []byte)
+func spanEventIDStringFromEventInternalID(raw []byte) (string, error) {
+	if len(raw) == 0 {
+		return "", fmt.Errorf("empty internal_id")
+	}
+	// Postgres BYTEA: 16 raw bytes
+	if len(raw) == 16 {
+		var id ulid.ULID
+		copy(id[:], raw)
+		return id.String(), nil
+	}
+	// Sqlite (or text): ULID string bytes
+	s := string(raw)
+	parsed, err := ulid.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid internal_id ulid string %q: %w", s, err)
+	}
+	return parsed.String(), nil
+}
 
 func NewQueries(db *sql.DB, driver string, o sqlc_postgres.NewNormalizedOpts) (q sqlc.Querier) {
 	if driver == "postgres" {
@@ -1138,7 +1182,7 @@ func (w wrapper) GetEventsByInternalIDs(ctx context.Context, ids []ulid.ULID) ([
 	return SQLiteToCQRSList(objs, sqliteEvent), nil
 }
 
-func (w wrapper) GetEventsByExpressions(ctx context.Context, cel []string) ([]*cqrs.Event, error) {
+func (w wrapper) GetEventsByExpressions(ctx context.Context, cel []string, from *time.Time, until *time.Time, limit uint) ([]*cqrs.Event, error) {
 	expHandler, err := run.NewExpressionHandler(ctx,
 		run.WithExpressionHandlerExpressions(cel),
 	)
@@ -1148,6 +1192,14 @@ func (w wrapper) GetEventsByExpressions(ctx context.Context, cel []string) ([]*c
 	prefilters, err := expHandler.ToSQLFilters(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Add time filters to match the runs query window
+	if from != nil {
+		prefilters = append(prefilters, sq.C("received_at").Gte(*from))
+	}
+	if until != nil {
+		prefilters = append(prefilters, sq.C("received_at").Lte(*until))
 	}
 
 	sql, args, err := sq.Dialect(w.dialect()).
@@ -1168,6 +1220,7 @@ func (w wrapper) GetEventsByExpressions(ctx context.Context, cel []string) ([]*c
 		).
 		Where(prefilters...).
 		Order(sq.C("received_at").Desc()).
+		Limit(limit).
 		ToSQL()
 	if err != nil {
 		return nil, err
@@ -1177,6 +1230,7 @@ func (w wrapper) GetEventsByExpressions(ctx context.Context, cel []string) ([]*c
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	res := []*cqrs.Event{}
 	for rows.Next() {
@@ -1223,6 +1277,21 @@ func (w wrapper) GetEvents(ctx context.Context, accountID uuid.UUID, workspaceID
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
+
+	if opts.CELQuery != "" {
+		events, err := w.GetEventsByExpressions(
+			ctx,
+			[]string{opts.CELQuery},
+			&opts.Oldest,
+			&opts.Newest,
+			uint(opts.Limit),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return events, nil
+	}
+
 	if opts.Cursor == nil {
 		opts.Cursor = &endULID
 	}
@@ -1255,6 +1324,7 @@ func (w wrapper) GetEvents(ctx context.Context, accountID uuid.UUID, workspaceID
 		return nil, err
 	}
 
+	celSQLDebugf("[CEL-debug] SQL: %s\nARGS: %v\n", sql, args)
 	rows, err := w.db.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
@@ -1289,6 +1359,20 @@ func (w wrapper) GetEvents(ctx context.Context, accountID uuid.UUID, workspaceID
 func (w wrapper) GetEventsCount(ctx context.Context, accountID uuid.UUID, workspaceID uuid.UUID, opts cqrs.WorkspaceEventsOpts) (int64, error) {
 	if err := opts.Validate(); err != nil {
 		return 0, err
+	}
+
+	if opts.CELQuery != "" {
+		evts, err := w.GetEventsByExpressions(
+			ctx,
+			[]string{opts.CELQuery},
+			&opts.Oldest,
+			&opts.Newest,
+			10_000, // pick a cap big enough for UI needs
+		)
+		if err != nil {
+			return 0, err
+		}
+		return int64(len(evts)), nil
 	}
 
 	// We don't want to consider cursor pagination for total count, so overwrite input param
@@ -1959,9 +2043,85 @@ type runsQueryBuilder struct {
 	order        []sqexp.OrderedExpression
 	cursor       *cqrs.TracePageCursor
 	cursorLayout *cqrs.TracePageCursor
+	eventFilters []sq.Expression // Event filters for CEL expressions
 }
 
-func newRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runsQueryBuilder {
+// prefixEventFilterColumnsForJoin adds "events." prefix to column references in event filters
+// when using JOINs to avoid column ambiguity. This works by converting expressions to SQL,
+// modifying the SQL string, and recreating the expressions.
+func prefixEventFilterColumnsForJoin(filters []sq.Expression) []sq.Expression {
+	prefixed := make([]sq.Expression, 0, len(filters))
+
+	// Build a temporary query to convert expressions to SQL strings
+	dialect := sq.Dialect("postgres")
+
+	for i, f := range filters {
+		// Try to convert the expression to SQL to see if it contains event_data
+		testQuery := dialect.Select().From("dummy").Where(f)
+		sql, args, _ := testQuery.ToSQL()
+
+		runsCELDebugf("[RUNS-CEL] prefixEventFilterColumnsForJoin: Filter %d SQL: %s\n", i, sql)
+
+		// Check if the SQL contains event_data without table prefix
+		if strings.Contains(sql, "event_data") && !strings.Contains(sql, "events.event_data") {
+			// Extract the WHERE clause first, then modify it
+			whereIdx := strings.Index(sql, " WHERE ")
+			if whereIdx < 0 {
+				runsCELDebugf("[RUNS-CEL] prefixEventFilterColumnsForJoin: Filter %d - no WHERE clause found, using original\n", i)
+				prefixed = append(prefixed, f)
+				continue
+			}
+
+			wherePart := sql[whereIdx+7:] // Skip " WHERE " (7 chars)
+			runsCELDebugf("[RUNS-CEL] prefixEventFilterColumnsForJoin: Filter %d original WHERE: %s\n", i, wherePart)
+
+			// Now modify just the WHERE clause part
+			modifiedWhere := wherePart
+			// Replace the specific patterns we know about - only replace if not already prefixed
+			if strings.Contains(modifiedWhere, "event_data #>>") && !strings.Contains(modifiedWhere, "events.event_data #>>") {
+				modifiedWhere = strings.ReplaceAll(modifiedWhere, "event_data #>>", "events.event_data #>>")
+			}
+			if strings.Contains(modifiedWhere, "event_data #>") && !strings.Contains(modifiedWhere, "events.event_data #>") {
+				modifiedWhere = strings.ReplaceAll(modifiedWhere, "event_data #>", "events.event_data #>")
+			}
+			if strings.Contains(modifiedWhere, "\"event_data\"") && !strings.Contains(modifiedWhere, "\"events\".\"event_data\"") {
+				modifiedWhere = strings.ReplaceAll(modifiedWhere, "\"event_data\"", "\"events\".\"event_data\"")
+			}
+
+			// Replace PostgreSQL placeholders ($1, $2, etc.) with ? for sq.L()
+			// sq.L() uses ? placeholders and goqu will handle numbering automatically
+			for j := 1; j <= len(args); j++ {
+				placeholder := fmt.Sprintf("$%d", j)
+				modifiedWhere = strings.ReplaceAll(modifiedWhere, placeholder, "?")
+			}
+
+			runsCELDebugf("[RUNS-CEL] prefixEventFilterColumnsForJoin: Modified filter %d WHERE clause: %s\n", i, modifiedWhere)
+			// Recreate the expression with modified SQL and same args
+			// Use ? placeholders which goqu will renumber correctly
+			prefixed = append(prefixed, sq.L(modifiedWhere, args...))
+		} else {
+			// No modification needed or already has table prefix
+			runsCELDebugf("[RUNS-CEL] prefixEventFilterColumnsForJoin: Filter %d unchanged\n", i)
+			prefixed = append(prefixed, f)
+		}
+	}
+	return prefixed
+}
+
+// prefixEventFilterColumns adds "events." prefix to column references in event filters
+// when using JOINs to avoid column ambiguity. This modifies raw SQL strings in sq.L() expressions
+// and updates sq.C() column references to use table-qualified names.
+func prefixEventFilterColumns(filters []sq.Expression) []sq.Expression {
+	// Check if it's a raw SQL expression (sq.L)
+	// We'll need to replace column names in the SQL string
+	// For now, we'll handle the common case: event_data and received_at
+	// This is a bit hacky but works for our use case
+	prefixed := make([]sq.Expression, 0, len(filters))
+	prefixed = append(prefixed, filters...)
+	return prefixed
+}
+
+func newRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt, eventFilters []sq.Expression, isPostgres bool) *runsQueryBuilder {
 	l := logger.StdlibLogger(ctx)
 
 	// filters
@@ -1991,6 +2151,9 @@ func newRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runsQuer
 		until = time.Now()
 	}
 	filter = append(filter, sq.C(tsfield).Lt(until.UnixMilli()))
+
+	// Note: Event filters will be applied via JOINs in GetTraceRuns/GetTraceRunsCount
+	// We don't add them to the filter here since we need to modify the FROM clause
 
 	// Layout to be used for the response cursors
 	resCursorLayout := cqrs.TracePageCursor{
@@ -2084,98 +2247,406 @@ func newRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runsQuer
 		order:        order,
 		cursor:       reqcursor,
 		cursorLayout: &resCursorLayout,
+		eventFilters: eventFilters,
 	}
 }
 
 func (w wrapper) GetTraceRunsCount(ctx context.Context, opt cqrs.GetTraceRunOpt) (int, error) {
-	// explicitly set it to zero so it would not attempt to paginate
-	opt.Items = 0
-	var (
-		res []*cqrs.TraceRun
-		err error
-	)
+	runsCELDebugf("[RUNS-CEL-debug] CEL filter value: %q\n", opt.Filter.CEL)
+
+	// Handle preview mode - query spans instead of trace_runs
 	if opt.Preview {
-		res, err = w.GetSpanRuns(ctx, opt)
-	} else {
-		res, err = w.GetTraceRuns(ctx, opt)
+		return w.getSpanRunsCount(ctx, opt)
 	}
+
+	// We only need the filters, not the rows.
+	// Keep CEL -> eventID logic so semantics match GetTraceRuns.
+	// Get event filters from CEL expressions if present
+	var eventFilters []sq.Expression
+	if cel := opt.Filter.CEL; cel != "" {
+		expHandler, err := run.NewExpressionHandler(
+			ctx,
+			run.WithExpressionHandlerBlob(cel, "\n"),
+		)
+		if err != nil {
+			return 0, err
+		}
+		if expHandler.HasEventFilters() {
+			// Convert CEL → SQL predicates for the events table
+			eventFilters, err = expHandler.ToSQLFilters(ctx)
+			if err != nil {
+				return 0, err
+			}
+			runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Found %d event filters from CEL\n", len(eventFilters))
+			// time window identical to dashboard - use events.received_at when JOINing
+			eventFilters = append(eventFilters,
+				sq.L("events.received_at >= ?", opt.Filter.From),
+				sq.L("events.received_at <= ?", opt.Filter.Until),
+			)
+			runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Total event filters (with time window): %d\n", len(eventFilters))
+		} else {
+			runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: No event filters found in CEL expression\n")
+		}
+	}
+
+	builder := newRunsQueryBuilder(ctx, opt, eventFilters, w.isPostgres())
+	filter := builder.filter
+
+	// Build COUNT query with JOINs if we have event filters
+	// Use sq.L() for COUNT(DISTINCT ...) to avoid goqu quoting issues
+	query := sq.Dialect(w.dialect()).
+		Select(sq.L("COUNT(DISTINCT trace_runs.run_id) AS count")).
+		From("trace_runs")
+
+	// If we have event filters, get matching events and then match runs via trace_runs.trigger_ids.
+	// NOTE: Do NOT rely on spans here; many runs won't have spans, and search would incorrectly return 0.
+	if len(eventFilters) > 0 && w.isPostgres() {
+		runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Applying event filters (PostgreSQL)\n")
+		runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Event filters count: %d\n", len(eventFilters))
+
+		// For COUNT query, we need to get matching event identifiers first.
+		// Different pipelines may store either internal_id (ULID string) or event_id (string),
+		// so collect both and match against trace_runs.trigger_ids.
+		var matchingEventIDStrings []string
+		eventIDQuery := sq.Dialect(w.dialect()).
+			From("events").
+			Select("internal_id", "event_id").
+			Where(eventFilters...)
+
+		eventIDSQL, eventIDArgs, err := eventIDQuery.ToSQL()
+		if err != nil {
+			return 0, err
+		}
+
+		runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Event ID query: %s\nARGS: %v\n", eventIDSQL, eventIDArgs)
+
+		rows, err := w.db.QueryContext(ctx, eventIDSQL, eventIDArgs...)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var internalIDRaw []byte
+			var eventID string
+			if err := rows.Scan(&internalIDRaw, &eventID); err != nil {
+				continue
+			}
+			if len(internalIDRaw) > 0 {
+				if idStr, err := spanEventIDStringFromEventInternalID(internalIDRaw); err == nil && idStr != "" {
+					matchingEventIDStrings = append(matchingEventIDStrings, idStr)
+				}
+			}
+			if eventID != "" {
+				matchingEventIDStrings = append(matchingEventIDStrings, eventID)
+			}
+		}
+
+		runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Found %d matching event IDs\n", len(matchingEventIDStrings))
+
+		if len(matchingEventIDStrings) == 0 {
+			return 0, nil
+		}
+
+		// Match the trace run's trigger_ids blob by substring presence (same semantics as sqlc query
+		// using POSITION($1 IN trigger_ids::text) > 0).
+		eventIDConditions := make([]sq.Expression, 0, len(matchingEventIDStrings))
+		for _, eventIDStr := range matchingEventIDStrings {
+			eventIDConditions = append(eventIDConditions, sq.L("POSITION(? IN trace_runs.trigger_ids::text) > 0", eventIDStr))
+		}
+
+		query = query.Where(sq.Or(eventIDConditions...)).Where(filter...)
+	} else {
+		if len(eventFilters) > 0 {
+			runsCELDebugf("[RUNS-CEL] GetTraceRunsCount: Event filters present but not PostgreSQL - skipping JOINs\n")
+		}
+		query = query.Where(filter...)
+	}
+
+	sqlStr, args, err := query.ToSQL()
+
+	runsCELDebugf("[RUNS-CEL] GetTraceRunsCount query SQL: %s\nARGS: %v\n", sqlStr, args)
+
 	if err != nil {
 		return 0, err
 	}
 
-	return len(res), nil
+	var count int
+	if err := w.db.QueryRowContext(ctx, sqlStr, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+// getSpanRunsCount counts span-based runs (preview mode) with CEL filtering
+func (w wrapper) getSpanRunsCount(ctx context.Context, opt cqrs.GetTraceRunOpt) (int, error) {
+	runsCELDebugf("[RUNS-CEL-debug] getSpanRunsCount CEL filter value: %q\n", opt.Filter.CEL)
+
+	// Get matching event IDs from CEL query (same logic as GetSpanRuns)
+	evtIDs := []string{}
+	if cel := opt.Filter.CEL; cel != "" {
+		expHandler, err := run.NewExpressionHandler(
+			ctx,
+			run.WithExpressionHandlerBlob(cel, "\n"),
+		)
+		if err != nil {
+			return 0, err
+		}
+		if expHandler.HasEventFilters() {
+			eventFilters, err := expHandler.ToSQLFilters(ctx)
+			if err != nil {
+				return 0, err
+			}
+			eventFilters = append(eventFilters,
+				sq.C("received_at").Gte(opt.Filter.From),
+				sq.C("received_at").Lte(opt.Filter.Until),
+			)
+			// spans.event_ids may contain either internal event ULIDs (as strings) or event_id strings,
+			// depending on the pipeline. Collect both to ensure filters work.
+			evtSQL, evtArgs, _ := sq.Dialect(w.dialect()).
+				From("events").
+				Select("internal_id", "event_id").
+				Where(eventFilters...).
+				ToSQL()
+
+			runsCELDebugf("[RUNS-CEL] getSpanRunsCount Event query SQL: %s\nARGS: %v\n", evtSQL, evtArgs)
+
+			rows, err := w.db.QueryContext(ctx, evtSQL, evtArgs...)
+			if err != nil {
+				runsCELDebugf("[RUNS-CEL] getSpanRunsCount: Event query error: %v\n", err)
+				return 0, err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var internalIDRaw []byte
+				var eventID string
+				if err := rows.Scan(&internalIDRaw, &eventID); err != nil {
+					continue
+				}
+				if len(internalIDRaw) > 0 {
+					if idStr, err := spanEventIDStringFromEventInternalID(internalIDRaw); err == nil && idStr != "" {
+						evtIDs = append(evtIDs, idStr)
+					}
+				}
+				if eventID != "" {
+					evtIDs = append(evtIDs, eventID)
+				}
+			}
+			runsCELDebugf("[RUNS-CEL] getSpanRunsCount: Found %d matching event IDs\n", len(evtIDs))
+			if len(evtIDs) == 0 {
+				return 0, nil
+			}
+		}
+	}
+
+	builder := newSpanRunsQueryBuilder(ctx, opt, evtIDs)
+	filter := builder.filter
+
+	// Build COUNT query for spans
+	query := sq.Dialect(w.dialect()).
+		Select(sq.L("COUNT(DISTINCT spans.run_id) AS count")).
+		From("spans").
+		Join(sq.T("trace_runs"), sq.On(sq.L("trace_runs.run_id = spans.run_id"))).
+		Where(sq.T("spans").Col("name").Eq(meta.SpanNameRun)).
+		Where(filter...)
+
+	// Apply status filter via trace_runs.status codes.
+	if len(opt.Filter.Status) > 0 {
+		statusCodes := make([]int64, 0, len(opt.Filter.Status))
+		for _, s := range opt.Filter.Status {
+			statusCodes = append(statusCodes, s.ToCode())
+		}
+		query = query.Where(sq.C("trace_runs.status").In(statusCodes))
+	}
+
+	sqlStr, args, err := query.ToSQL()
+	if err != nil {
+		return 0, err
+	}
+
+	runsCELDebugf("[RUNS-CEL] getSpanRunsCount query SQL: %s\nARGS: %v\n", sqlStr, args)
+
+	var count int
+	if err := w.db.QueryRowContext(ctx, sqlStr, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
 func (w wrapper) GetTraceRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*cqrs.TraceRun, error) {
+	runsCELDebugf("[RUNS-CEL-debug] GetTraceRuns CEL: %q\n", opt.Filter.CEL)
 	if opt.Preview {
 		return w.GetSpanRuns(ctx, opt)
 	}
 
 	l := logger.StdlibLogger(ctx)
 
-	// use evtIDs as post query filter
-	evtIDs := []string{}
-	expHandler, err := run.NewExpressionHandler(ctx,
-		run.WithExpressionHandlerBlob(opt.Filter.CEL, "\n"),
+	cel := opt.Filter.CEL
+	runsCELDebugf("[RUNS-CEL-debug] GetTraceRuns: CEL value = %q, EventExprList length = %d\n", cel, 0)
+	expHandler, err := run.NewExpressionHandler(
+		ctx,
+		run.WithExpressionHandlerBlob(cel, "\n"),
 	)
 	if err != nil {
 		return nil, err
 	}
+
+	runsCELDebugf("[RUNS-CEL-debug] GetTraceRuns: After creating handler, EventExprList length = %d\n", len(expHandler.EventExprList))
+	if len(expHandler.EventExprList) > 0 {
+		runsCELDebugf("[RUNS-CEL-debug] GetTraceRuns: EventExprList = %v\n", expHandler.EventExprList)
+	}
+
+	// Get event filters from CEL expressions if present
+	// We'll JOIN directly to events table instead of collecting event IDs
+	var eventFilters []sq.Expression
 	if expHandler.HasEventFilters() {
-		evts, err := w.GetEventsByExpressions(ctx, expHandler.EventExprList)
+		var err error
+		eventFilters, err = expHandler.ToSQLFilters(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, e := range evts {
-			evtIDs = append(evtIDs, e.ID.String())
-		}
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Found %d event filters from CEL\n", len(eventFilters))
+		// Add time window filters - use events.received_at since we'll JOIN to events table
+		// Use sq.L() to avoid goqu quoting issues with table.column syntax
+		eventFilters = append(eventFilters,
+			sq.L("events.received_at >= ?", opt.Filter.From),
+			sq.L("events.received_at <= ?", opt.Filter.Until),
+		)
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Total event filters (with time window): %d\n", len(eventFilters))
+
+		// Prefix event filter columns with "events." table name for JOIN queries
+		// This handles sq.L() raw SQL strings that reference event_data
+		eventFilters = prefixEventFilterColumnsForJoin(eventFilters)
+	} else {
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: No event filters found in CEL expression\n")
 	}
 
-	builder := newRunsQueryBuilder(ctx, opt)
+	// Pass event filters to query builder - it will JOIN to events table directly
+	builder := newRunsQueryBuilder(ctx, opt, eventFilters, w.isPostgres())
 	filter := builder.filter
 	order := builder.order
 	reqcursor := builder.cursor
 	resCursorLayout := builder.cursorLayout
 
-	// read from database
-	// TODO:
-	// change this to a continuous loop with limits instead of just attempting to grab everything.
-	// might not matter though since this is primarily meant for local
-	// development
-	sql, args, err := sq.Dialect(w.dialect()).
-		From("trace_runs").
+	// If we have event filters, first get matching internal event IDs.
+	// Different pipelines may store either internal_id (ULID string) or event_id (string).
+	// Collect both and match against trace_runs.trigger_ids.
+	var matchingEventIDStrings []string
+	if len(eventFilters) > 0 && w.isPostgres() {
+		// Query events to get matching internal_id values, then convert to ULID strings.
+		eventIDQuery := sq.Dialect(w.dialect()).
+			From("events").
+			Select("internal_id", "event_id").
+			Where(eventFilters...)
+
+		eventIDSQL, eventIDArgs, err := eventIDQuery.ToSQL()
+		if err != nil {
+			return nil, err
+		}
+
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Event ID query: %s\nARGS: %v\n", eventIDSQL, eventIDArgs)
+
+		rows, err := w.db.QueryContext(ctx, eventIDSQL, eventIDArgs...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var internalIDRaw []byte
+			var eventID string
+			if err := rows.Scan(&internalIDRaw, &eventID); err != nil {
+				runsCELDebugf("[RUNS-CEL] GetTraceRuns: Error scanning event ID: %v\n", err)
+				continue
+			}
+			if len(internalIDRaw) > 0 {
+				idStr, err := spanEventIDStringFromEventInternalID(internalIDRaw)
+				if err != nil {
+					runsCELDebugf("[RUNS-CEL] GetTraceRuns: Invalid internal_id: %v\n", err)
+				} else if idStr != "" {
+					matchingEventIDStrings = append(matchingEventIDStrings, idStr)
+				}
+			}
+			if eventID != "" {
+				matchingEventIDStrings = append(matchingEventIDStrings, eventID)
+			}
+		}
+
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Found %d matching event IDs\n", len(matchingEventIDStrings))
+
+		if len(matchingEventIDStrings) == 0 {
+			// No matching events, return empty result
+			return []*cqrs.TraceRun{}, nil
+		}
+	}
+
+	// Build query with JOINs if we have event filters (PostgreSQL only)
+	query := sq.Dialect(w.dialect()).
 		Select(
-			"app_id",
-			"function_id",
-			"trace_id",
-			"run_id",
-			"queued_at",
-			"started_at",
-			"ended_at",
-			"status",
-			"source_id",
-			"trigger_ids",
-			"output",
-			"batch_id",
-			"is_debounce",
-			"cron_schedule",
-			"has_ai",
+			"trace_runs.app_id",
+			"trace_runs.function_id",
+			"trace_runs.trace_id",
+			"trace_runs.run_id",
+			"trace_runs.queued_at",
+			"trace_runs.started_at",
+			"trace_runs.ended_at",
+			"trace_runs.status",
+			"trace_runs.source_id",
+			"trace_runs.trigger_ids",
+			"trace_runs.output",
+			"trace_runs.batch_id",
+			"trace_runs.is_debounce",
+			"trace_runs.cron_schedule",
+			"trace_runs.has_ai",
 		).
-		Where(filter...).
-		Order(order...).
-		ToSQL()
+		From("trace_runs")
+
+	// If we have event filters, match via trace_runs.trigger_ids (PostgreSQL only).
+	// Do NOT require spans here; otherwise search returns 0 for runs without traces.
+	if len(eventFilters) > 0 && w.isPostgres() && len(matchingEventIDStrings) > 0 {
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Applying event filters via trace_runs.trigger_ids (PostgreSQL)\n")
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Using %d matching event ID strings\n", len(matchingEventIDStrings))
+
+		eventIDConditions := make([]sq.Expression, 0, len(matchingEventIDStrings))
+		for _, eventIDStr := range matchingEventIDStrings {
+			eventIDConditions = append(eventIDConditions, sq.L("POSITION(? IN trace_runs.trigger_ids::text) > 0", eventIDStr))
+		}
+
+		query = query.Where(sq.Or(eventIDConditions...)).Where(filter...)
+	} else {
+		if len(eventFilters) > 0 {
+			runsCELDebugf("[RUNS-CEL] GetTraceRuns: Event filters present but not PostgreSQL - skipping JOINs\n")
+		}
+		query = query.Where(filter...)
+	}
+
+	// Add ORDER BY and LIMIT
+	query = query.Order(order...).Limit(opt.Items)
+
+	sql, args, err := query.ToSQL()
+
+	runsCELDebugf("[RUNS-CEL] Main trace_runs query SQL: %s\nARGS: %v\n", sql, args)
+
 	if err != nil {
 		return nil, err
 	}
 
 	rows, err := w.db.QueryContext(ctx, sql, args...)
 	if err != nil {
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Query error: %v\n", err)
 		return nil, err
 	}
+	defer rows.Close()
 
 	res := []*cqrs.TraceRun{}
 	var count uint
+	var rowCount int
+	var scannedRowCount int
 	for rows.Next() {
+		scannedRowCount++
+		rowCount++
 		data := sqlc.TraceRun{}
 		err := rows.Scan(
 			&data.AppID,
@@ -2195,16 +2666,14 @@ func (w wrapper) GetTraceRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*
 			&data.HasAi,
 		)
 		if err != nil {
-			return nil, err
-		}
-
-		// filter out runs that doesn't have the event IDs
-		if len(evtIDs) > 0 && !data.HasEventIDs(evtIDs) {
+			runsCELDebugf("[RUNS-CEL] GetTraceRuns: Scan error at row %d: %v\n", scannedRowCount, err)
 			continue
 		}
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Scanned row %d, RunID: %s\n", scannedRowCount, data.RunID.String())
 
 		// the cursor target should be skipped
 		if reqcursor.ID == data.RunID.String() {
+			runsCELDebugf("[RUNS-CEL] GetTraceRuns: Skipping row %d (cursor match)\n", scannedRowCount)
 			continue
 		}
 
@@ -2259,6 +2728,7 @@ func (w wrapper) GetTraceRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*
 			batchID = &data.BatchID
 		}
 
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Adding run to results: run_id=%s, app_id=%s, function_id=%s\n", data.RunID.String(), data.AppID.String(), data.FunctionID.String())
 		res = append(res, &cqrs.TraceRun{
 			AppID:        data.AppID,
 			FunctionID:   data.FunctionID,
@@ -2284,6 +2754,12 @@ func (w wrapper) GetTraceRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*
 		if opt.Items > 0 && count >= opt.Items {
 			break
 		}
+	}
+
+	runsCELDebugf("[RUNS-CEL] GetTraceRuns: Query completed - total rows scanned: %d, results added: %d\n", scannedRowCount, len(res))
+	if err := rows.Err(); err != nil {
+		runsCELDebugf("[RUNS-CEL] GetTraceRuns: Rows error: %v\n", err)
+		return nil, err
 	}
 
 	return res, nil
@@ -2669,6 +3145,7 @@ func (w wrapper) GetWorkerConnections(ctx context.Context, opt cqrs.GetWorkerCon
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	res := []*cqrs.WorkerConnection{}
 	var count uint
@@ -2811,64 +3288,124 @@ func (w wrapper) GetSpanRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*c
 	l := logger.StdlibLogger(ctx)
 
 	// use evtIDs as post query filter
-	// evtIDs := []string{}
-	// expHandler, err := run.NewExpressionHandler(ctx,
-	// 	run.WithExpressionHandlerBlob(opt.Filter.CEL, "\n"),
-	// )
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// if expHandler.HasEventFilters() {
-	// 	evts, err := w.GetEventsByExpressions(ctx, expHandler.EventExprList)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	for _, e := range evts {
-	// 		evtIDs = append(evtIDs, e.ID.String())
-	// 	}
-	// }
+	evtIDs := []string{}
+	if cel := opt.Filter.CEL; cel != "" {
+		expHandler, err := run.NewExpressionHandler(
+			ctx,
+			run.WithExpressionHandlerBlob(cel, "\n"),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if expHandler.HasEventFilters() {
+			eventFilters, err := expHandler.ToSQLFilters(ctx)
+			if err != nil {
+				return nil, err
+			}
+			eventFilters = append(eventFilters,
+				sq.C("received_at").Gte(opt.Filter.From),
+				sq.C("received_at").Lte(opt.Filter.Until),
+			)
+			// spans.event_ids may contain either internal event ULIDs (as strings) or event_id strings,
+			// depending on the pipeline. Collect both to ensure filters work.
+			evtSQL, evtArgs, _ := sq.Dialect(w.dialect()).
+				From("events").
+				Select("internal_id", "event_id").
+				Where(eventFilters...).
+				ToSQL()
 
-	builder := newSpanRunsQueryBuilder(ctx, opt)
+			runsCELDebugf("[RUNS-CEL] GetSpanRuns Event query SQL: %s\nARGS: %v\n", evtSQL, evtArgs)
+
+			rows, err := w.db.QueryContext(ctx, evtSQL, evtArgs...)
+			if err != nil {
+				runsCELDebugf("[RUNS-CEL] GetSpanRuns: Event query error: %v\n", err)
+				return nil, err
+			}
+			defer rows.Close()
+			var rowCount int
+			for rows.Next() {
+				rowCount++
+				var internalIDRaw []byte
+				var eventID string
+				if err := rows.Scan(&internalIDRaw, &eventID); err != nil {
+					runsCELDebugf("[RUNS-CEL] GetSpanRuns: Scan error: %v\n", err)
+					continue
+				}
+				if len(internalIDRaw) > 0 {
+					idStr, err := spanEventIDStringFromEventInternalID(internalIDRaw)
+					if err != nil {
+						runsCELDebugf("[RUNS-CEL] GetSpanRuns: Invalid internal_id: %v\n", err)
+					} else if idStr != "" {
+						evtIDs = append(evtIDs, idStr)
+					}
+				}
+				if eventID != "" {
+					evtIDs = append(evtIDs, eventID)
+				}
+			}
+			runsCELDebugf("[RUNS-CEL] GetSpanRuns: Found %d matching event IDs from %d rows\n", len(evtIDs), rowCount)
+			if len(evtIDs) == 0 {
+				l.Debug("no events matched CEL in preview mode")
+				return []*cqrs.TraceRun{}, nil
+			}
+			l.Debug("found events matching CEL", "count", len(evtIDs))
+		}
+	}
+
+	builder := newSpanRunsQueryBuilder(ctx, opt, evtIDs)
 	filter := builder.filter
 	order := builder.order
 	resCursorLayout := builder.cursorLayout
 
 	// Query spans table directly, similar to how GetTraceRuns queries
 	// trace_runs
-	sql, args, err := sq.Dialect(w.dialect()).
+	query := sq.Dialect(w.dialect()).
 		From("spans").
+		Join(sq.T("trace_runs"), sq.On(sq.L("trace_runs.run_id = spans.run_id"))).
 		Select(
-			"run_id",
-			"account_id",
-			"app_id",
-			"function_id",
-			"trace_id",
-			"dynamic_span_id",
-			"start_time",
-			"end_time",
-			"status",
-			"span_id",
-			"name",
-			"attributes",
-			"links",
-			"output",
-			"event_ids",
-			"input",
+			sq.L("spans.run_id"),
+			sq.L("spans.account_id"),
+			sq.L("spans.app_id"),
+			sq.L("spans.function_id"),
+			sq.L("spans.trace_id"),
+			sq.L("spans.dynamic_span_id"),
+			sq.L("spans.start_time"),
+			sq.L("spans.end_time"),
+			sq.L("spans.status"),
+			sq.L("spans.span_id"),
+			sq.L("spans.name"),
+			sq.L("spans.attributes"),
+			sq.L("spans.links"),
+			sq.L("spans.output"),
+			sq.L("spans.event_ids"),
+			sq.L("spans.input"),
 		).
-		Where(sq.C("dynamic_span_id").In(
-			sq.Dialect(w.dialect()).Select("dynamic_span_id").Distinct().From("spans").Where(sq.C("name").Eq(meta.SpanNameRun)),
-		)).
+		Where(sq.T("spans").Col("name").Eq(meta.SpanNameRun)).
 		Where(filter...).
 		Order(order...).
-		ToSQL()
+		Limit(opt.Items)
+
+	// Apply status filter via trace_runs.status codes.
+	if len(opt.Filter.Status) > 0 {
+		statusCodes := make([]int64, 0, len(opt.Filter.Status))
+		for _, s := range opt.Filter.Status {
+			statusCodes = append(statusCodes, s.ToCode())
+		}
+		query = query.Where(sq.C("trace_runs.status").In(statusCodes))
+	}
+
+	sql, args, err := query.ToSQL()
 	if err != nil {
 		return nil, err
 	}
+
+	runsCELDebugf("[RUNS-CEL] GetSpanRuns: Spans query SQL: %s\nARGS: %v\n", sql, args)
 
 	rows, err := w.db.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	// Define span row structure for scanning
 	type spanRow struct {
@@ -2970,6 +3507,44 @@ func (w wrapper) GetSpanRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*c
 		return runGroups[i].startTime.After(runGroups[j].startTime)
 	})
 
+	// Fetch authoritative statuses from trace_runs so the list shows correct status
+	// immediately (executor.run spans often lack final status).
+	statusByRunID := map[string]enums.RunStatus{}
+	if w.isPostgres() && len(runGroups) > 0 {
+		ids := make([]string, 0, len(runGroups))
+		seen := map[string]struct{}{}
+		for _, g := range runGroups {
+			if _, ok := seen[g.runID]; ok {
+				continue
+			}
+			seen[g.runID] = struct{}{}
+			ids = append(ids, g.runID)
+		}
+
+		// Use IN (...) for simplicity; page size is bounded by opt.Items.
+		statusSQL, statusArgs, err := sq.Dialect(w.dialect()).
+			From("trace_runs").
+			Select("run_id", "status").
+			Where(sq.C("run_id").In(ids)).
+			ToSQL()
+		if err == nil {
+			rows, err := w.db.QueryContext(ctx, statusSQL, statusArgs...)
+			if err == nil {
+				func() {
+					defer rows.Close()
+					for rows.Next() {
+						var runID string
+						var statusCode int64
+						if err := rows.Scan(&runID, &statusCode); err != nil {
+							continue
+						}
+						statusByRunID[runID] = enums.RunCodeToStatus(statusCode)
+					}
+				}()
+			}
+		}
+	}
+
 	res := []*cqrs.TraceRun{}
 	var count uint
 
@@ -3000,6 +3575,9 @@ func (w wrapper) GetSpanRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*c
 		startTime := spans[0].StartTime
 		var endTime *time.Time
 		status := enums.RunStatusRunning
+		if s, ok := statusByRunID[group.runID]; ok && s != enums.RunStatusUnknown {
+			status = s
+		}
 		var triggerIDs []string
 
 		for _, span := range spans {
@@ -3009,11 +3587,13 @@ func (w wrapper) GetSpanRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*c
 			if span.EndTime != nil && (endTime == nil || span.EndTime.After(*endTime)) {
 				endTime = span.EndTime
 			}
-			// Get the latest non-empty status
-			if span.Status != nil && *span.Status != "" {
-				// Convert StepStatus string to RunStatus enum
-				if stepStatus, err := enums.StepStatusString(*span.Status); err == nil {
-					status = enums.StepStatusToRunStatus(stepStatus)
+			// If we didn't find a status in trace_runs, fall back to the span's dynamic status.
+			if _, ok := statusByRunID[group.runID]; !ok {
+				if span.Status != nil && *span.Status != "" {
+					// Convert StepStatus string to RunStatus enum
+					if stepStatus, err := enums.StepStatusString(*span.Status); err == nil {
+						status = enums.StepStatusToRunStatus(stepStatus)
+					}
 				}
 			}
 
@@ -3090,27 +3670,50 @@ func (w wrapper) GetSpanRuns(ctx context.Context, opt cqrs.GetTraceRunOpt) ([]*c
 
 // newSpanRunsQueryBuilder creates a query builder for span-based runs Similar
 // to newRunsQueryBuilder but adapted for spans table structure
-func newSpanRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runsQueryBuilder {
+func newSpanRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt, eventIDs []string) *runsQueryBuilder {
 	l := logger.StdlibLogger(ctx)
 
 	// filters
 	filter := []sq.Expression{}
 	//
 	// debug runs are a special kind of run that should not be included in the main runs list
-	filter = append(filter, sq.C("debug_run_id").IsNull())
+	filter = append(filter, sq.T("spans").Col("debug_run_id").IsNull())
+	if len(eventIDs) > 0 {
+		// Filter spans where event_ids contains any of the matching event IDs.
+		//
+		// NOTE: although event_ids is JSONB, production data can vary:
+		// - JSON array of strings (expected)
+		// - JSON string
+		// - stringified JSON array
+		//
+		// To make search reliable, match against the textual representation.
+		eventIDFilters := []sq.Expression{}
+		for _, eventID := range eventIDs {
+			// Match within the JSONB text representation. This is less strict than @> but
+			// guarantees results for mixed storage formats.
+			eventIDFilters = append(eventIDFilters,
+				sq.L("(spans.event_ids IS NOT NULL AND POSITION(? IN spans.event_ids::text) > 0)", eventID),
+			)
+		}
+		filter = append(filter, sq.Or(eventIDFilters...))
+		runsCELDebugf("[RUNS-CEL] GetSpanRuns: Added %d event ID filters\n", len(eventIDFilters))
+	}
 	if len(opt.Filter.AppID) > 0 {
-		filter = append(filter, sq.C("app_id").In(opt.Filter.AppID))
+		appIDs := make([]string, 0, len(opt.Filter.AppID))
+		for _, id := range opt.Filter.AppID {
+			appIDs = append(appIDs, id.String())
+		}
+		filter = append(filter, sq.T("spans").Col("app_id").In(appIDs))
 	}
 	if len(opt.Filter.FunctionID) > 0 {
-		filter = append(filter, sq.C("function_id").In(opt.Filter.FunctionID))
-	}
-	if len(opt.Filter.Status) > 0 {
-		statusStrings := make([]string, 0, len(opt.Filter.Status))
-		for _, s := range opt.Filter.Status {
-			statusStrings = append(statusStrings, s.String())
+		fnIDs := make([]string, 0, len(opt.Filter.FunctionID))
+		for _, id := range opt.Filter.FunctionID {
+			fnIDs = append(fnIDs, id.String())
 		}
-		filter = append(filter, sq.C("status").In(statusStrings))
+		filter = append(filter, sq.T("spans").Col("function_id").In(fnIDs))
 	}
+	// Status filtering in preview mode must use trace_runs.status (authoritative numeric codes),
+	// not spans.status (often queued/scheduled dynamic status strings).
 
 	// Map time fields - spans use start_time/end_time instead of
 	// queued_at/started_at/ended_at
@@ -3124,9 +3727,10 @@ func newSpanRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runs
 		tsfield = "start_time"
 	}
 
-	// Convert time to Unix milliseconds to match spans storage format
-	filter = append(filter, sq.C(tsfield).Gte(opt.Filter.From))
-	filter = append(filter, sq.C(tsfield).Lt(opt.Filter.Until))
+	// Use time.Time directly for TIMESTAMPTZ columns in PostgreSQL
+	// For SQLite, this will be converted to DATETIME format
+	filter = append(filter, sq.T("spans").Col(tsfield).Gte(opt.Filter.From))
+	filter = append(filter, sq.T("spans").Col(tsfield).Lt(opt.Filter.Until))
 
 	// cursor
 	resCursorLayout := &cqrs.TracePageCursor{
@@ -3161,14 +3765,14 @@ func newSpanRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runs
 
 		switch o.Direction {
 		case enums.TraceRunOrderAsc:
-			order = append(order, sq.C(field).Asc())
+			order = append(order, sq.T("spans").Col(field).Asc())
 		case enums.TraceRunOrderDesc:
-			order = append(order, sq.C(field).Desc())
+			order = append(order, sq.T("spans").Col(field).Desc())
 		}
 	}
 
 	// Always add run_id as final sort field for stable pagination
-	order = append(order, sq.C("run_id").Asc())
+	order = append(order, sq.T("spans").Col("run_id").Asc())
 	resCursorLayout.Add("run_id")
 
 	// cursor-based pagination filter
@@ -3187,16 +3791,20 @@ func newSpanRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runs
 			}
 
 			if cursor := reqCursor.Find(field); cursor != nil {
+				// Cursor values are encoded as Unix milliseconds. Convert back to time.Time
+				// for comparing against TIMESTAMPTZ columns.
+				cursorTime := time.UnixMilli(cursor.Value)
+
 				// Build cursor condition for this field
 				var baseCondition sq.Expression
 				if o.Direction == enums.TraceRunOrderAsc {
-					baseCondition = sq.C(field).Gt(cursor.Value)
+					baseCondition = sq.T("spans").Col(field).Gt(cursorTime)
 				} else {
-					baseCondition = sq.C(field).Lt(cursor.Value)
+					baseCondition = sq.T("spans").Col(field).Lt(cursorTime)
 				}
 
 				// Build compound condition for tie-breaking
-				equalityConditions := []sq.Expression{sq.C(field).Eq(cursor.Value)}
+				equalityConditions := []sq.Expression{sq.T("spans").Col(field).Eq(cursorTime)}
 
 				// Add conditions for all subsequent fields in sort order
 				for j := i + 1; j < len(opt.Order); j++ {
@@ -3211,17 +3819,19 @@ func newSpanRunsQueryBuilder(ctx context.Context, opt cqrs.GetTraceRunOpt) *runs
 					}
 
 					if nextCursor := reqCursor.Find(nextField); nextCursor != nil {
+						nextCursorTime := time.UnixMilli(nextCursor.Value)
 						if opt.Order[j].Direction == enums.TraceRunOrderAsc {
-							equalityConditions = append(equalityConditions, sq.C(nextField).Gt(nextCursor.Value))
+							equalityConditions = append(equalityConditions, sq.T("spans").Col(nextField).Gt(nextCursorTime))
 						} else {
-							equalityConditions = append(equalityConditions, sq.C(nextField).Lt(nextCursor.Value))
+							equalityConditions = append(equalityConditions, sq.T("spans").Col(nextField).Lt(nextCursorTime))
 						}
 					}
 				}
 
-				// Add run_id tie-breaker
-				if runIDCursor := reqCursor.Find("run_id"); runIDCursor != nil {
-					equalityConditions = append(equalityConditions, sq.C("run_id").Gt(runIDCursor.Value))
+				// Add run_id tie-breaker using the composite cursor's ID (run_id),
+				// since run_id is not an int64 field.
+				if reqCursor.ID != "" {
+					equalityConditions = append(equalityConditions, sq.T("spans").Col("run_id").Gt(reqCursor.ID))
 				}
 
 				// Combine: (field > cursor_value) OR (field = cursor_value AND next_conditions)

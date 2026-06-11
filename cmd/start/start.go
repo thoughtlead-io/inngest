@@ -117,6 +117,7 @@ func action(ctx context.Context, cmd *cli.Command) error {
 	redisURI := localconfig.GetValue(cmd, "redis-uri", "")
 	sqliteDir := localconfig.GetValue(cmd, "sqlite-dir", "")
 	sdkURLs := localconfig.GetStringSlice(cmd, "sdk-url")
+	noPoll := localconfig.GetBoolValue(cmd, "no-poll", false)
 
 	connectGatewayPort := localconfig.GetIntValue(cmd, "connect-gateway-port", devserver.DefaultConnectGatewayPort)
 	connectGatewayGRPCPort := localconfig.GetIntValue(cmd, "connect-gateway-grpc-port", devserver.DefaultConnectGatewayGRPCPort)
@@ -129,6 +130,7 @@ func action(ctx context.Context, cmd *cli.Command) error {
 		EventKeys:               eventKeys,
 		InMemory:                false,
 		NoUI:                    localconfig.GetBoolValue(cmd, "no-ui", false),
+		Poll:                    !noPoll,
 		PollInterval:            localconfig.GetIntValue(cmd, "poll-interval", devserver.DefaultPollInterval),
 		PostgresConnMaxIdleTime: cmd.Int("postgres-conn-max-idle-time"),
 		PostgresConnMaxLifetime: cmd.Int("postgres-conn-max-lifetime"),
