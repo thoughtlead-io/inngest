@@ -26,8 +26,9 @@ dockers:
   use: buildx
   dockerfile: 'Dockerfile.goreleaser'
   image_templates:
-  - "ECR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/inngest:latest"
-  - "ECR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/inngest:{{ .Tag }}"
+  # Set ECR_REGISTRY to your registry host, e.g. <account-id>.dkr.ecr.us-east-1.amazonaws.com
+  - "{{ .Env.ECR_REGISTRY }}/inngest:latest"
+  - "{{ .Env.ECR_REGISTRY }}/inngest:{{ .Tag }}"
   build_flag_templates:
   - "--pull"
   - "--label=org.opencontainers.image.created={{.Date}}"

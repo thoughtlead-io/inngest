@@ -37,5 +37,7 @@ go.work.sum
 # Local Go build cache
 .gocache/
 
-# Generated per-release goreleaser config
+# Local goreleaser configs with environment-specific registry details
 .goreleaser.beta.yml
+.goreleaser.prod.yml
+.goreleaser.staging.yml
