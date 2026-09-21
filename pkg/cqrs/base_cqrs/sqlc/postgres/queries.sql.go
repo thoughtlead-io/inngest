@@ -9,7 +9,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,21 +36,11 @@ func (q *Queries) DeleteFunctionsByAppID(ctx context.Context, appID uuid.UUID) e
 }
 
 const deleteFunctionsByIDs = `-- name: DeleteFunctionsByIDs :exec
-UPDATE functions SET archived_at = NOW() WHERE id IN ($1)
+UPDATE functions SET archived_at = NOW() WHERE id = ANY($1::text[])
 `
 
-func (q *Queries) DeleteFunctionsByIDs(ctx context.Context, ids []uuid.UUID) error {
-	query := deleteFunctionsByIDs
-	var queryParams []interface{}
-	if len(ids) > 0 {
-		for _, v := range ids {
-			queryParams = append(queryParams, v)
-		}
-		query = strings.Replace(query, "/*SLICE:ids*/?", strings.Repeat(",?", len(ids))[1:], 1)
-	} else {
-		query = strings.Replace(query, "/*SLICE:ids*/?", "NULL", 1)
-	}
-	_, err := q.db.ExecContext(ctx, query, queryParams...)
+func (q *Queries) DeleteFunctionsByIDs(ctx context.Context, ids []string) error {
+	_, err := q.db.ExecContext(ctx, deleteFunctionsByIDs, pq.Array(ids))
 	return err
 }
 
@@ -678,21 +667,11 @@ func (q *Queries) GetFunctionRun(ctx context.Context, runID ulid.ULID) (*GetFunc
 }
 
 const getFunctionRunFinishesByRunIDs = `-- name: GetFunctionRunFinishesByRunIDs :many
-SELECT run_id, status, output, completed_step_count, created_at FROM function_finishes WHERE run_id IN ($1)
+SELECT run_id, status, output, completed_step_count, created_at FROM function_finishes WHERE run_id = ANY($1::BYTEA[])
 `
 
-func (q *Queries) GetFunctionRunFinishesByRunIDs(ctx context.Context, runIds []ulid.ULID) ([]*FunctionFinish, error) {
-	query := getFunctionRunFinishesByRunIDs
-	var queryParams []interface{}
-	if len(runIds) > 0 {
-		for _, v := range runIds {
-			queryParams = append(queryParams, v)
-		}
-		query = strings.Replace(query, "/*SLICE:run_ids*/?", strings.Repeat(",?", len(runIds))[1:], 1)
-	} else {
-		query = strings.Replace(query, "/*SLICE:run_ids*/?", "NULL", 1)
-	}
-	rows, err := q.db.QueryContext(ctx, query, queryParams...)
+func (q *Queries) GetFunctionRunFinishesByRunIDs(ctx context.Context, dollar_1 [][]byte) ([]*FunctionFinish, error) {
+	rows, err := q.db.QueryContext(ctx, getFunctionRunFinishesByRunIDs, pq.Array(dollar_1))
 	if err != nil {
 		return nil, err
 	}

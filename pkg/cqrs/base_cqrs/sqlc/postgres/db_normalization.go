@@ -345,7 +345,11 @@ func (q NormalizedQueries) DeleteFunctionsByAppID(ctx context.Context, appID uui
 }
 
 func (q NormalizedQueries) DeleteFunctionsByIDs(ctx context.Context, ids []uuid.UUID) error {
-	return q.db.DeleteFunctionsByIDs(ctx, ids)
+	strIDs := make([]string, len(ids))
+	for i, id := range ids {
+		strIDs[i] = id.String()
+	}
+	return q.db.DeleteFunctionsByIDs(ctx, strIDs)
 }
 
 func (q NormalizedQueries) UpdateFunctionConfig(ctx context.Context, arg sqlc_sqlite.UpdateFunctionConfigParams) (*sqlc_sqlite.Function, error) {
@@ -530,7 +534,11 @@ func (q NormalizedQueries) GetFunctionRunsTimebound(ctx context.Context, params 
 }
 
 func (q NormalizedQueries) GetFunctionRunFinishesByRunIDs(ctx context.Context, runIDs []ulid.ULID) ([]*sqlc_sqlite.FunctionFinish, error) {
-	finishes, err := q.db.GetFunctionRunFinishesByRunIDs(ctx, runIDs)
+	byteIDs := make([][]byte, len(runIDs))
+	for i, id := range runIDs {
+		byteIDs[i] = id[:]
+	}
+	finishes, err := q.db.GetFunctionRunFinishesByRunIDs(ctx, byteIDs)
 	if err != nil {
 		return nil, err
 	}
