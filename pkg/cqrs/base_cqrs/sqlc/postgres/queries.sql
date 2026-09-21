@@ -83,7 +83,7 @@ UPDATE functions SET config = $1, archived_at = NULL WHERE id = $2 RETURNING *;
 UPDATE functions SET archived_at = CURRENT_TIMESTAMP WHERE app_id = $1;
 
 -- name: DeleteFunctionsByIDs :exec
-UPDATE functions SET archived_at = NOW() WHERE id IN (sqlc.slice('ids'));
+UPDATE functions SET archived_at = NOW() WHERE id = ANY(@ids::text[]);
 
 
 --
@@ -129,7 +129,7 @@ LEFT JOIN function_finishes ON function_finishes.run_id = function_runs.run_id
 WHERE function_runs.event_id IN (SELECT UNNEST(sqlc.slice('event_ids')::BYTEA[]));
 
 -- name: GetFunctionRunFinishesByRunIDs :many
-SELECT * FROM function_finishes WHERE run_id IN (sqlc.slice('run_ids'));
+SELECT * FROM function_finishes WHERE run_id = ANY($1::BYTEA[]);
 
 
 --
